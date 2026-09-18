@@ -232,7 +232,7 @@ jobs:
             exit 1
           fi
           rm -rf /tmp/cann-extracted
-          bisheng=/opt/bisheng-toolkit/bisheng_compiler/bin
+          bisheng=/opt/bisheng-toolkit/tools/bisheng_compiler/bin
           echo "BiSheng compiler contents:"
           ls -lah "$bisheng"
           test -x "$bisheng/bisheng" || {
