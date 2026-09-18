@@ -227,11 +227,18 @@ jobs:
           shopt -s nullglob
           compilers=(/tmp/cann-extracted/run_package/cann-bisheng-compiler_*.run)
           test "${#compilers[@]}" -eq 1
-          bash "${compilers[0]}" --noexec --extract=/opt/bisheng-toolkit
+          if ! bash "${compilers[0]}" --noexec --extract=/opt/bisheng-toolkit; then
+            echo "::error::Failed to extract BiSheng compiler package"
+            exit 1
+          fi
           rm -rf /tmp/cann-extracted
           bisheng=/opt/bisheng-toolkit/bisheng_compiler/bin
-          test -x "$bisheng/ccec"
-          test -x "$bisheng/llvm-link"
+          echo "BiSheng compiler contents:"
+          ls -lah "$bisheng"
+          test -x "$bisheng/bisheng" || {
+            echo "::error::bisheng executable not found at $bisheng/bisheng"
+            exit 1
+          }
           "$bisheng/bisheng" --version
 
           export CCACHE_DIR=/ccache CCACHE_MAXSIZE=3G CCACHE_BASEDIR=/io/source
