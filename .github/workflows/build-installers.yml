@@ -1,0 +1,451 @@
+name: Build AscendNPU-IR installers
+
+on:
+  schedule:
+    - cron: '43 2 * * *'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Upstream branch, tag, or commit
+        default: master
+        required: true
+        type: string
+      force:
+        description: Rebuild into a separate release
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ascendnpu-ir-installers
+  cancel-in-progress: false
+
+env:
+  CANN_VERSION: '9.1.0'
+
+jobs:
+  resolve:
+    runs-on: ubuntu-26.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - name: Resolve upstream and check release completeness
+        id: resolve
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref || 'master' }}
+          FORCE_BUILD: ${{ inputs.force && 'true' || 'false' }}
+        run: |
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          def api(path, missing_ok=False):
+              request = urllib.request.Request(
+                  'https://api.github.com/' + path,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json'},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  if missing_ok and error.code == 404:
+                      return None
+                  raise
+
+          ref = urllib.parse.quote(os.environ['SOURCE_REF'], safe='')
+          sha = api(f'repos/Ascend/AscendNPU-IR/commits/{ref}')['sha']
+          if not re.fullmatch(r'[0-9a-f]{40}', sha):
+              raise RuntimeError('Invalid upstream SHA')
+          repo = os.environ['GITHUB_REPOSITORY']
+          builder = os.environ['GITHUB_SHA']
+          cann = os.environ['CANN_VERSION']
+          tag = f'installers-{sha[:12]}-{builder[:12]}'
+          expected = {
+              f'ascendnpu-ir-{sha[:7]}-cann{cann}-linux-glibc2.28-{arch}.run'
+              for arch in ('x86_64', 'aarch64')
+          }
+          release = api(f'repos/{repo}/releases/tags/{tag}', missing_ok=True)
+          assets = (release or {}).get('assets', [])
+          complete = bool(release and not release['draft']
+                          and {a['name'] for a in assets} == expected
+                          and all(a['size'] > 0 for a in assets))
+          force = os.environ['FORCE_BUILD'] == 'true'
+          if force or (release and not release['draft'] and not complete):
+              tag += '-run' + os.environ['GITHUB_RUN_ID']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'sha={sha}\ntag={tag}\nbuild={str(force or not complete).lower()}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write(f'Upstream: `{sha}`\n\nRelease: `{tag}`\n\n')
+              out.write('Complete release exists; skipped.\n' if complete and not force
+                        else 'Building x86_64 and aarch64 installers.\n')
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    name: Installer / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-26.04
+            cann_url: https://ascend-cann-open.obs.cn-north-4.myhuaweicloud.com/CANN/CANN%209.1.0/Ascend-cann_9.1.0_linux-x86_64.run
+          - arch: aarch64
+            runner: ubuntu-26.04-arm
+            cann_url: https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.1.0/Ascend-cann-toolkit_9.1.0_linux-aarch64.run
+    env:
+      SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+      BUILD_ARCH: ${{ matrix.arch }}
+      CANN_URL: ${{ matrix.cann_url }}
+      BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: Ascend/AscendNPU-IR
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: source
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
+
+      - name: Free unused SDK space on the disposable hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Remove this step when adapting to a self-hosted runner.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Initialize only required submodules at upstream-pinned commits
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule sync -- third-party/llvm-project third-party/torch-mlir
+          for module in third-party/llvm-project third-party/torch-mlir; do
+            for attempt in 1 2 3; do
+              if git submodule update --init --depth 1 -- "$module"; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then exit 1; fi
+              sleep 10
+            done
+            expected=$(git rev-parse "HEAD:$module")
+            actual=$(git -C "$module" rev-parse HEAD)
+            test "$actual" = "$expected"
+          done
+          # These submodules already carry Ascend patches. Do not reapply patches.
+          # shmem is intentionally excluded: SHMEM_BUILD_TEMPLATE is OFF.
+
+      - name: Cache compiler objects
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ runner.temp }}/npui-ccache
+          key: npui-ml228-${{ matrix.arch }}-cann9.1.0-v1-${{ github.sha }}-${{ needs.resolve.outputs.sha }}
+          restore-keys: |
+            npui-ml228-${{ matrix.arch }}-cann9.1.0-v1-${{ github.sha }}-
+            npui-ml228-${{ matrix.arch }}-cann9.1.0-v1-
+
+      - name: Build compiler tools and template libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/npui-ccache" dist
+          image="quay.io/pypa/manylinux_2_28_${BUILD_ARCH}:latest"
+          docker pull "$image"
+          docker image inspect "$image" --format '{{json .RepoDigests}}'
+          docker run --rm -i \
+            --env SOURCE_SHA --env BUILD_ARCH --env CANN_URL --env CANN_VERSION \
+            --env BUILD_JOBS --env GITHUB_SHA \
+            --volume "$GITHUB_WORKSPACE:/io" \
+            --volume "$RUNNER_TEMP/npui-ccache:/ccache" \
+            --workdir /io/source "$image" bash -seuo pipefail <<'BUILD'
+          test "$(uname -m)" = "$BUILD_ARCH"
+          export PATH="/opt/python/cp312-cp312/bin:$PATH"
+          dnf install -y clang lld ccache libstdc++-static
+          python -m pip install 'cmake>=3.28,<4' 'ninja>=1.12,<2'
+          git config --global --add safe.directory /io/source
+          git config --global --add safe.directory /io/source/third-party/llvm-project
+          git config --global --add safe.directory /io/source/third-party/torch-mlir
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+          # Extract only the compiler for build-time use; never bundle CANN itself.
+          curl --fail --location --retry 5 --retry-delay 5 \
+            --connect-timeout 30 --output /tmp/cann.run "$CANN_URL"
+          cann_sha=$(sha256sum /tmp/cann.run | cut -d' ' -f1)
+          bash /tmp/cann.run --noexec --extract=/tmp/cann-extracted
+          rm /tmp/cann.run
+          shopt -s nullglob
+          compilers=(/tmp/cann-extracted/run_package/cann-bisheng-compiler_*.run)
+          test "${#compilers[@]}" -eq 1
+          bash "${compilers[0]}" --noexec --extract=/opt/bisheng-toolkit
+          rm -rf /tmp/cann-extracted
+          bisheng=/opt/bisheng-toolkit/bisheng_compiler/bin
+          test -x "$bisheng/ccec"
+          test -x "$bisheng/llvm-link"
+          "$bisheng/bisheng" --version
+
+          export CCACHE_DIR=/ccache CCACHE_MAXSIZE=3G CCACHE_BASEDIR=/io/source
+          export CCACHE_COMPILERCHECK=content
+          bash build-tools/build.sh -o /io/source/build \
+            --build-type Release -j "$BUILD_JOBS" \
+            --install-prefix /io/payload \
+            --bishengir-publish ON \
+            --build-torch-mlir -t --bisheng-compiler "$bisheng" \
+            --enable-lld --safety-options --safety-ld-options --skip-rpath \
+            --add-cmake-options='-DLLVM_PARALLEL_LINK_JOBS=1' \
+            --add-cmake-options='-DLLVM_STATIC_LINK_CXX_STDLIB=ON' \
+            --add-cmake-options='-DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF' \
+            --add-cmake-options='-DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBEDIT=OFF'
+
+          for tool in bishengir-compile bishengir-opt hivmc; do
+            test -x "/io/payload/bin/$tool"
+            "/io/payload/bin/$tool" --version
+          done
+          # Fail if template compilation was silently omitted.
+          for arch in c220 c310; do
+            for core in aic aiv mix.aic mix.aiv; do
+              test -s "/io/payload/lib/meta_op.${core}.${arch}.bc"
+            done
+          done
+          test -s /io/payload/lib/host.bc
+
+          # .run is not a wheel: auditwheel cannot repair it. Check host ELF files.
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+          allowed = {'libc.so.6', 'libm.so.6', 'libdl.so.2', 'libpthread.so.0',
+                     'librt.so.1', 'libgcc_s.so.1', 'ld-linux-x86-64.so.2',
+                     'ld-linux-aarch64.so.1'}
+          count = 0
+          for path in Path('/io/payload').rglob('*'):
+              if not path.is_file():
+                  continue
+              with path.open('rb') as f:
+                  if f.read(4) != b'\x7fELF':
+                      continue
+              count += 1
+              versions = subprocess.check_output(['readelf', '--version-info', str(path)], text=True)
+              glibc = [tuple(map(int, v.split('.'))) for v in re.findall(r'GLIBC_(\d+\.\d+(?:\.\d+)?)', versions)]
+              if glibc and max(glibc) > (2, 28):
+                  raise RuntimeError(f'{path}: requires glibc newer than 2.28')
+              dynamic = subprocess.check_output(['readelf', '-d', str(path)], text=True)
+              needed = set(re.findall(r'\(NEEDED\).*\[(.*?)\]', dynamic))
+              if needed - allowed:
+                  raise RuntimeError(f'{path}: unexpected runtime dependencies: {needed - allowed}')
+              print(f'{path.name}: dependencies={sorted(needed)}, glibc={max(glibc) if glibc else None}')
+          if count == 0:
+              raise RuntimeError('No ELF binaries in package')
+          PY
+
+          mkdir -p /io/payload/licenses
+          cp LICENSE /io/payload/licenses/AscendNPU-IR-LICENSE
+          cp NOTICE /io/payload/licenses/AscendNPU-IR-NOTICE
+          cp third-party/llvm-project/LICENSE.TXT /io/payload/licenses/LLVM-LICENSE.txt
+          cp third-party/torch-mlir/LICENSE /io/payload/licenses/Torch-MLIR-LICENSE
+          # Include notices for vendored code linked into the tools.
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+          root = Path('bishengir/triton')
+          for path in root.rglob('*'):
+              if path.is_file() and path.name.lower().startswith(('license', 'copying', 'notice')):
+                  target = Path('/io/payload/licenses/triton') / path.relative_to(root)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(path, target)
+          PY
+          {
+            printf 'upstream: https://github.com/Ascend/AscendNPU-IR/commit/%s\n' "$SOURCE_SHA"
+            printf 'builder: %s\narchitecture: %s\nCANN: %s\n' "$GITHUB_SHA" "$BUILD_ARCH" "$CANN_VERSION"
+            printf 'CANN URL: %s\nCANN SHA256: %s\n' "$CANN_URL" "$cann_sha"
+            git submodule status third-party/llvm-project third-party/torch-mlir
+            cmake --version
+            clang --version
+          } > /io/payload/BUILD-INFO.txt
+          printf '%s\n' "$BUILD_ARCH" > /io/payload/ARCH
+          ccache --show-stats
+          BUILD
+
+      - name: Restore ownership
+        if: always()
+        shell: bash
+        run: |
+          for path in "$RUNNER_TEMP/npui-ccache" "$GITHUB_WORKSPACE/payload"; do
+            if [ -d "$path" ]; then sudo chown -R "$(id -u):$(id -g)" "$path"; fi
+          done
+
+      - name: Fetch pinned Makeself
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: megastep/makeself
+          ref: 3815292f7359a4ccab8e27bdbe8a844947c51e4c # release-2.7.1
+          path: makeself
+          persist-credentials: false
+
+      - name: Package standalone installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > payload/set_env.sh <<'ENV'
+          # Source this file with Bash after sourcing your CANN environment.
+          ascendnpu_ir_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+          export PATH="$ascendnpu_ir_root/bin:$PATH"
+          unset ascendnpu_ir_root
+          ENV
+          mkdir -p bundle
+          mv payload bundle/payload
+          cat > bundle/install.sh <<'INSTALL'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          prefix=''
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              --install-path)
+                [ "$#" -ge 2 ] || { echo 'Missing installation path' >&2; exit 2; }
+                prefix=$2; shift 2 ;;
+              --install-path=*) prefix=${1#*=}; shift ;;
+              --help)
+                echo 'Usage: bash installer.run -- --install-path /absolute/new/directory'
+                exit 0 ;;
+              *) echo "Unknown option: $1" >&2; exit 2 ;;
+            esac
+          done
+          case "$prefix" in
+            /*) ;;
+            *) echo '--install-path must be an absolute path' >&2; exit 2 ;;
+          esac
+          test "$(uname -s)" = Linux
+          if [ "$(uname -m)" != "$(cat payload/ARCH)" ]; then
+            echo 'Installer architecture does not match this machine' >&2; exit 1
+          fi
+          glibc=$(getconf GNU_LIBC_VERSION | awk '{print $2}')
+          if [ "$(printf '%s\n' 2.28 "$glibc" | sort -V | head -n1)" != 2.28 ]; then
+            echo 'glibc 2.28 or newer is required' >&2; exit 1
+          fi
+          # A new prefix avoids overwriting a CANN installation or earlier build.
+          mkdir -p -- "$(dirname -- "$prefix")"
+          mkdir -- "$prefix" || { echo 'Choose a new installation directory' >&2; exit 1; }
+          cp -a payload/. "$prefix/"
+          printf 'Installed to %s\nActivate with: source %q/set_env.sh\n' "$prefix" "$prefix"
+          INSTALL
+          chmod +x bundle/install.sh
+          name="ascendnpu-ir-${SOURCE_SHA:0:7}-cann${CANN_VERSION}-linux-glibc2.28-${BUILD_ARCH}.run"
+          bash makeself/makeself.sh --gzip --complevel 6 --sha256 --nox11 \
+            bundle "dist/$name" "AscendNPU-IR ${SOURCE_SHA:0:7} / ${BUILD_ARCH} / CANN ${CANN_VERSION}" \
+            ./install.sh
+          bash "dist/$name" --check
+
+      - name: Test installer in clean Linux containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Tests run without the build container's toolchain or CANN installation.
+          for image in almalinux:8 ubuntu:22.04; do
+            docker run --rm -i --volume "$GITHUB_WORKSPACE/dist:/dist:ro" \
+              "$image" bash -seuo pipefail <<'TEST'
+          bash /dist/*.run -- --install-path /opt/ascendnpu-ir
+          source /opt/ascendnpu-ir/set_env.sh
+          bishengir-compile --version
+          bishengir-opt --version
+          hivmc --version
+          printf 'module {}\n' | bishengir-opt -o /tmp/smoke.mlir
+          test -s /tmp/smoke.mlir
+          TEST
+          done
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: installer-${{ matrix.arch }}
+          path: dist/*.run
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: installer-*
+          merge-multiple: true
+          path: release-assets
+      - name: Publish only the two installers
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          def api(path, method='GET', payload=None, missing_ok=False):
+              request = urllib.request.Request(
+                  'https://api.github.com/' + path, method=method,
+                  data=None if payload is None else json.dumps(payload).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json',
+                           'Content-Type': 'application/json'},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  if missing_ok and error.code == 404:
+                      return None
+                  raise
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          sha = os.environ['SOURCE_SHA']
+          tag = os.environ['RELEASE_TAG']
+          cann = os.environ['CANN_VERSION']
+          expected = {f'ascendnpu-ir-{sha[:7]}-cann{cann}-linux-glibc2.28-{arch}.run'
+                      for arch in ('x86_64', 'aarch64')}
+          assets = sorted(Path('release-assets').glob('*.run'))
+          if {p.name for p in assets} != expected or any(p.stat().st_size == 0 for p in assets):
+              raise RuntimeError('Expected exactly one nonempty installer per architecture')
+          for path in assets:
+              subprocess.run(['bash', str(path), '--check'], check=True)
+          release = api(f'repos/{repo}/releases/tags/{tag}', missing_ok=True)
+          if release and not release['draft']:
+              raise RuntimeError('Refusing to replace a published release; use force rebuild')
+          payload = {'name': f'ascendnpu-ir {sha[:7]}',
+                     'body': f'upstream: https://github.com/Ascend/AscendNPU-IR/commit/{sha}',
+                     'prerelease': True}
+          if release:
+              release = api(f"repos/{repo}/releases/{release['id']}", 'PATCH', payload)
+          else:
+              release = api(f'repos/{repo}/releases', 'POST', {
+                  **payload, 'tag_name': tag, 'target_commitish': os.environ['GITHUB_SHA'], 'draft': True})
+          # A failed earlier run may have left a draft. Keep only expected installers.
+          for asset in release.get('assets', []):
+              if asset['name'] not in expected:
+                  subprocess.run(['gh', 'release', 'delete-asset', tag, asset['name'],
+                                  '--repo', repo, '--yes'], check=True)
+          subprocess.run(['gh', 'release', 'upload', tag, '--repo', repo, '--clobber',
+                          *map(str, assets)], check=True)
+          release = api(f"repos/{repo}/releases/{release['id']}", 'PATCH',
+                        {'draft': False, 'prerelease': True, 'make_latest': 'false'})
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write(f"Published [installers]({release['html_url']}).\n")
